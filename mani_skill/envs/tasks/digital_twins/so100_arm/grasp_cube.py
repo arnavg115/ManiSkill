@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+import os
 from typing import Any, Dict, Optional, Sequence, Union
 
 import dacite
@@ -41,6 +42,9 @@ class SO100GraspCubeDomainRandomizationConfig:
     """scale of noise added to the camera view rotation"""
     camera_fov_noise: float = np.deg2rad(2)
     """scale of noise added to the camera fov"""
+    randomzie_hdri: bool = True
+    hdri_directory: str = "hdri_maps"
+
 
     ### task-specific related domain randomizations that occur during scene loading ###
     cube_half_size_range: Sequence[float] = (0.022 / 2, 0.028 / 2)
@@ -48,6 +52,9 @@ class SO100GraspCubeDomainRandomizationConfig:
     cube_friction_std: float = 0.05
     cube_friction_bounds: Sequence[float] = (0.1, 0.5)
     randomize_cube_color: bool = True
+    randomize_canvas_color: bool = True
+
+
 
     def dict(self):
         return {k: v for k, v in asdict(self).items()}
@@ -71,6 +78,7 @@ class SO100GraspCubeEnv(BaseDigitalTwinEnv):
     SUPPORTED_ROBOTS = ["so100"]
     SUPPORTED_OBS_MODES = ["none", "state", "state_dict", "rgb+segmentation"]
     agent: SO100
+    CANVAS_THICKNESS = 0.001
 
     def __init__(
         self,
@@ -177,6 +185,11 @@ class SO100GraspCubeEnv(BaseDigitalTwinEnv):
                 ambient_colors = self._batched_episode_rng.uniform(0.2, 0.5, size=(3,))
                 for i, scene in enumerate(self.scene.sub_scenes):
                     scene.render_system.ambient_light = ambient_colors[i]
+            if self.domain_randomization_config.randomzie_hdri:
+                hdri_maps = os.listdir(os.path.join(os.path.dirname(__file__), self.domain_randomization_config.hdri_directory))
+                for i, scene in enumerate(self.scene.sub_scenes):
+                    scene.set_environment_map(os.path.join(os.path.dirname(__file__),self.domain_randomization_config.hdri_directory,hdri_maps[i%len(hdri_maps)])) # randomized hdri maps depending on number of hdri maps in directory
+
         else:
             self.scene.set_ambient_light([0.3, 0.3, 0.3])
         self.scene.add_directional_light(
@@ -200,7 +213,9 @@ class SO100GraspCubeEnv(BaseDigitalTwinEnv):
             / 2
         )
         colors = np.zeros((self.num_envs, 3))
+        canvas_colors = np.zeros((self.num_envs, 3))
         colors[:, 0] = 1
+        canvas_colors[:,0] = 0
         frictions = (
             np.ones(self.num_envs) * self.domain_randomization_config.cube_friction_mean
         )
@@ -215,6 +230,11 @@ class SO100GraspCubeEnv(BaseDigitalTwinEnv):
             )
             if self.domain_randomization_config.randomize_cube_color:
                 colors = self._batched_episode_rng.uniform(low=0, high=1, size=(3,))
+            if self.domain_randomization_config.randomize_canvas_color:
+                canvas_colors = self._batched_episode_rng.uniform(low=0, high=1, size=(3,))
+                canvas_colors = np.concatenate([canvas_colors, np.ones((self.num_envs, 1))], axis=-1)
+
+
             frictions = self._batched_episode_rng.normal(
                 self.domain_randomization_config.cube_friction_mean,
                 self.domain_randomization_config.cube_friction_std,
@@ -225,6 +245,8 @@ class SO100GraspCubeEnv(BaseDigitalTwinEnv):
 
         self.cube_half_sizes = common.to_tensor(half_sizes, device=self.device)
         colors = np.concatenate([colors, np.ones((self.num_envs, 1))], axis=-1)
+        if not self.domain_randomization_config.randomize_canvas_color:
+            canvas_colors =  np.concatenate([canvas_colors, np.ones((self.num_envs, 1))], axis=-1) # set alpha to 0 if no randomization, ie use table base color
 
         # build our cubes
         cubes = []
@@ -247,7 +269,7 @@ class SO100GraspCubeEnv(BaseDigitalTwinEnv):
                     base_color=colors[i],
                 ),
             )
-            builder.initial_pose = sapien.Pose(p=[0, 0, half_sizes[i]])
+            builder.initial_pose = sapien.Pose(p=[0, 0, half_sizes[i] + self.CANVAS_THICKNESS])
             builder.set_scene_idxs([i])
             cube = builder.build(name=f"cube-{i}")
             cubes.append(cube)
@@ -258,9 +280,36 @@ class SO100GraspCubeEnv(BaseDigitalTwinEnv):
         self.cube = Actor.merge(cubes, name="cube")
         self.add_to_state_dict_registry(self.cube)
 
+
+        if self.domain_randomization_config.randomize_canvas_color:
+            canvases = []
+            for i in range(self.num_envs):
+                # create a different canvas in each parallel environment
+                # using our randomized colors, frictions, and sizes
+                builder = self.scene.create_actor_builder()
+                builder.add_box_visual(
+                    half_size=[0.4, 1, 0],
+                    material=sapien.render.RenderMaterial(base_color=canvas_colors[i]),
+                )
+                builder.add_box_collision(
+                    half_size=[0.4, 1, 0],
+                )
+                builder.initial_pose = sapien.Pose(p=[0.4, -0.6, half_sizes[i]])
+                builder.set_scene_idxs([i])
+                canvas = builder.build_static(name=f"canvas-{i}")
+                canvases.append(canvas)
+                self.remove_from_state_dict_registry(canvas)
+
+            self.canvas = Actor.merge(canvases, name="canvas")
+            self.add_to_state_dict_registry(self.canvas)
+
+
+
         # we want to only keep the robot and the cube in the render, everything else is greenscreened.
         self.remove_object_from_greenscreen(self.agent.robot)
         self.remove_object_from_greenscreen(self.cube)
+        if self.domain_randomization_config.randomize_canvas_color:
+            self.remove_object_from_greenscreen(self.canvas)
 
         # a hardcoded initial joint configuration for the robot to start from
         self.rest_qpos = torch.tensor(
